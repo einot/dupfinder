@@ -29,16 +29,24 @@ __copyright__ = "Copyright (C) 2021 Eino Tuominen"
 __license__ = "MIT License"
 __version__ = "1.0"
 
-from typing import List, Set, Dict, Tuple, Optional, Generator
+from typing import List, Set, Dict, Tuple, Optional, Generator, Callable
 
 import os
 from hashlib import sha256
+from xxhash import xxh3_64
+from blake3 import blake3
+import sys
 import pathlib
+import stat
+
+import multiprocessing as mp
+from multiprocessing.pool import ThreadPool
+from multiprocessing.queues import Queue
 
 # one disk block
-SCANSIZE = 4096
+SCANSIZE = 409600
 
-def hasher(*files, scansize, hashfunc) -> Generator[Tuple[str, str], None, None]:
+def hasher(*files: str, scansize: int, hashfunc: Callable, prewash: bool = False) -> Generator[Tuple[str, str], None, None]:
     """Calculates hashes for files
 
     A generator function to calculate hashes for a list of files.
@@ -48,7 +56,7 @@ def hasher(*files, scansize, hashfunc) -> Generator[Tuple[str, str], None, None]
         List of file paths
       scansize:
         Read scansize bytes from the beginning of the file.
-        If scansize = 0, process the whole file.
+        use sys.maxsize for full file
       hashfunc:
         Hash function to use for calculation
 
@@ -56,18 +64,62 @@ def hasher(*files, scansize, hashfunc) -> Generator[Tuple[str, str], None, None]
       A tuple which is a pair (hash, filename).
     """
 
-    for filename in files:
-        with open(filename, 'rb') as file:
-            if scansize:
-                d = file.read(scansize)
-                x = hashfunc(d).hexdigest()
-            else:
-                xx = hashfunc()
-                for byte_block in iter(lambda: file.read(4096),b""):
-                    xx.update(byte_block)
-                x = xx.hexdigest()
-        yield x, filename
+    threadcount = mp.cpu_count()
 
+    def queuer(input_q, files):
+        for filename in files:
+            input_q.put(filename)
+        for _ in range(threadcount):    # Once generator is consumed, send end-signal
+            input_q.put(None)
+
+    # threadpool worker
+    def worker(input_q, output_q):
+        while True:
+            filename = input_q.get()
+            if filename is None:
+                output_q.put(None)
+                break
+            try:
+                if scansize:
+                    with open(filename, 'rb') as file:
+                        if scansize < 10 * 1024 ** 2: # 1 megabyte
+                            logger.debug(f"fast scanning {scansize} bytes of {filename}")
+                            d = file.read(scansize)
+                            x = hashfunc(d).digest()
+                        else:
+                            logger.debug(f"starting full scan of {filename}")
+                            xx = hashfunc()
+                            for i, byte_block in enumerate(iter(lambda: file.read(16*1024), b"")):
+                                xx.update(byte_block)
+                                logger.debug(f"updating {filename} hash with block {i}")
+                            x = xx.digest()
+                            logger.debug(f"finished scanning {filename}")
+                elif prewash:
+                    sr = os.stat(filename)
+                    if not stat.S_ISREG(sr.st_mode):    
+                        continue
+                    x = sr.st_size
+                else:
+                    raise ValueError('Contradicting scansize and prewash parameters')
+            except FileNotFoundError as e:
+                logger.info(f"File {filename} disappeared")
+            output_q.put((x, filename))
+
+
+    input_q: Queue = mp.Queue(maxsize=threadcount)
+    output_q: Queue = mp.Queue(maxsize=threadcount)
+
+    genpool = ThreadPool(1, initializer=queuer, initargs=(input_q, files))
+    tpool = ThreadPool(threadcount, initializer=worker, initargs=(input_q, output_q))
+
+    workers = threadcount
+    while workers:
+        result = output_q.get()
+        if result is None:
+            workers -= 1
+        else:
+            yield result
+    
 def filewalker(path: str, exclude: Optional[List[str]] = None) -> Generator[str, None, None]:
     """Walk through a filesystem
 
@@ -81,19 +133,17 @@ def filewalker(path: str, exclude: Optional[List[str]] = None) -> Generator[str,
         List of exclusion strings
 
     Yields:
-      Filenames as string
+      Filenames
     """
 
-    for dirpath, dirnames, filenames in os.walk(path):
+    for dirpath, dirnames, filenames in os.walk(path, topdown=False):
         if exclude and any(e in dirpath for e in exclude):
             continue
         for f in filenames:
             fpath = os.path.join(dirpath, f)
-            if not os.path.isfile(fpath):
-                continue
             yield fpath
 
-def duplicates(*files, scansize, hashfunc) -> Dict[str, List[str]]:
+def duplicates(*files: str, scansize: int, hashfunc: Callable, prewash: bool = False) -> Dict[str, List[str]]:
     """Returns a duplicate files
 
     Returns a dict that contains filenames that have identical
@@ -118,7 +168,7 @@ def duplicates(*files, scansize, hashfunc) -> Dict[str, List[str]]:
     candidates: Dict[str, str] = {}
     duplicates: Dict[str, List[str]] = {}
     
-    for hash, filename in hasher(*files, scansize=scansize, hashfunc=hashfunc):
+    for hash, filename in hasher(*files, scansize=scansize, hashfunc=hashfunc, prewash=prewash):
         if hash in duplicates:
             duplicates[hash].append(filename)
         elif hash in candidates: 
@@ -147,23 +197,28 @@ def dupfinder(path: str, exclude: Optional[List[str]] = []) -> Dict[str, List[st
       }
     """ 
 
-    # First pass
+    # First pass, dedup based on filenames
+    # prewash also filters out other than regular files
+    noop = lambda *x : None
     files = filewalker(path, exclude=exclude)
-    dups = duplicates(*files, scansize=SCANSIZE, hashfunc=sha256)
+    dups = duplicates(*files, scansize=0, prewash=True, hashfunc=noop)
 
-    # Second pass
+    # Second pass, short hashes
+    logger.info(f"commencing fast scan of {len(dups.values())} files")
     files = (file for files in dups.values() for file in files)
-    dups = duplicates(*files, scansize=100*SCANSIZE, hashfunc=sha256)
+    dups = duplicates(*files, scansize=SCANSIZE, hashfunc=blake3)
 
-    # Third pass
+    # Final pass, full files
+    logger.info(f"commencing full scan of {len(dups.values())} files")
     files = (file for files in dups.values() for file in files)
-    dups = duplicates(*files, scansize=0, hashfunc=sha256)
+    dups = duplicates(*files, scansize=sys.maxsize, hashfunc=blake3)
 
     return dups
 
 if __name__ == '__main__':
     import json
     import argparse
+    import logging
 
     parser = argparse.ArgumentParser(description='Find duplicate files within a path')
     parser.add_argument('--path', dest='path', type=pathlib.Path,
@@ -174,8 +229,25 @@ if __name__ == '__main__':
                        )
     parser.add_argument('--format', dest='format', choices=['txt', 'json'], action='store',
                         help="Output format. Text is default", default='txt'
-                       )
+                       ) 
+    parser.add_argument('--verbose', dest='verbose', action='store_true',
+                        help="Verbose logging",
+                       ) 
+    parser.add_argument('--debug', dest='debug', action='store_true',
+                        help="Debug level logging"
+                       ) 
+
     args = parser.parse_args()
+    logging.basicConfig(level=logging.DEBUG)
+    logger = logging.getLogger()
+
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+    elif args.verbose:
+        logger.setLevel(logging.INFO)
+        logger.debug('jeejee')
+    else:
+        logger.setLevel(logging.ERROR)
 
     dups = dupfinder(args.path, args.exclude)
 

@@ -32,11 +32,13 @@ __version__ = "1.0"
 from typing import List, Set, Dict, Tuple, Optional, Generator, Callable
 
 import os
+import re
 from hashlib import sha256
 from xxhash import xxh3_64
 from blake3 import blake3
 import sys
 import pathlib
+from pathlib import Path
 import stat
 
 import multiprocessing as mp
@@ -85,25 +87,25 @@ def hasher(*files: str, scansize: int, hashfunc: Callable, prewash: bool = False
                         if scansize < 10 * 1024 ** 2: # 1 megabyte
                             logger.debug(f"fast scanning {scansize} bytes of {filename}")
                             d = file.read(scansize)
-                            x = hashfunc(d).digest()
+                            hashvalue = hashfunc(d).hexdigest()
                         else:
                             logger.debug(f"starting full scan of {filename}")
                             xx = hashfunc()
                             for i, byte_block in enumerate(iter(lambda: file.read(16*1024), b"")):
                                 xx.update(byte_block)
                                 logger.debug(f"updating {filename} hash with block {i}")
-                            x = xx.digest()
+                            hashvalue = xx.hexdigest()
                             logger.debug(f"finished scanning {filename}")
                 elif prewash:
                     sr = os.stat(filename)
                     if not stat.S_ISREG(sr.st_mode):    
                         continue
-                    x = sr.st_size
+                    hashvalue = sr.st_size
                 else:
                     raise ValueError('Contradicting scansize and prewash parameters')
             except FileNotFoundError as e:
                 logger.info(f"File {filename} disappeared")
-            output_q.put((x, filename))
+            output_q.put((hashvalue, filename))
 
 
     input_q: Queue = mp.Queue(maxsize=threadcount)
@@ -120,7 +122,7 @@ def hasher(*files: str, scansize: int, hashfunc: Callable, prewash: bool = False
         else:
             yield result
     
-def filewalker(path: str, exclude: Optional[List[str]] = None) -> Generator[str, None, None]:
+def filewalker(path: str, exclude: Optional[List[str]] = None, minsize: int = 0) -> Generator[str, None, None]:
     """Walk through a filesystem
 
     A generator to walk through the filesystem under a path. Supports
@@ -141,7 +143,8 @@ def filewalker(path: str, exclude: Optional[List[str]] = None) -> Generator[str,
             continue
         for f in filenames:
             fpath = os.path.join(dirpath, f)
-            yield fpath
+            if os.path.getsize(fpath) >= minsize:
+                yield fpath
 
 def duplicates(*files: str, scansize: int, hashfunc: Callable, prewash: bool = False) -> Dict[str, List[str]]:
     """Returns a duplicate files
@@ -177,7 +180,7 @@ def duplicates(*files: str, scansize: int, hashfunc: Callable, prewash: bool = F
             candidates[hash] = filename
     return duplicates
 
-def dupfinder(path: str, exclude: Optional[List[str]] = []) -> Dict[str, List[str]]:
+def dupfinder(path: str, exclude: Optional[List[str]] = [], minsize: int = 0) -> Dict[str, List[str]]:
     """Returns duplicate files
 
     Walks through a file path and finds duplicates by comparing hash digests of the files.
@@ -200,7 +203,7 @@ def dupfinder(path: str, exclude: Optional[List[str]] = []) -> Dict[str, List[st
     # First pass, dedup based on filenames
     # prewash also filters out other than regular files
     noop = lambda *x : None
-    files = filewalker(path, exclude=exclude)
+    files = filewalker(path, exclude=exclude, minsize=minsize)
     dups = duplicates(*files, scansize=0, prewash=True, hashfunc=noop)
 
     # Second pass, short hashes
@@ -215,6 +218,48 @@ def dupfinder(path: str, exclude: Optional[List[str]] = []) -> Dict[str, List[st
 
     return dups
 
+def rmduplicatesfrom(path: str, dups: Dict[str, List[str]]):
+    rmfrom_path = Path(path).resolve()
+
+    for hash, filelist in dups.items():
+        candidates_for_deletion = set()
+        other_copies = set()
+
+        for filename in filelist:
+            file_path = Path(filename).resolve()
+            if rmfrom_path in file_path.parents:
+                candidates_for_deletion.add(file_path)
+            else:
+                other_copies.add(file_path)
+            
+        if candidates_for_deletion:
+            if not other_copies:
+                candidates_for_deletion.pop()
+            for file in candidates_for_deletion:
+                logger.info(f"deleting {file}")
+                file.unlink()
+
+def rmduplicatesre(expression: str, dups: Dict[str, List[str]]):
+    pattern = re.compile(expression)
+    
+    for hash, filelist in dups.items():
+        candidates_for_deletion = set()
+        other_copies = set()
+
+        for filename in filelist:
+            file_path = Path(filename).resolve()
+            if pattern.search(file_path.name):
+                candidates_for_deletion.add(file_path)
+            else:
+                other_copies.add(file_path)
+            
+        if candidates_for_deletion:
+            if not other_copies:
+                candidates_for_deletion.pop()
+            for file in candidates_for_deletion:
+                logger.info(f"deleting {file}")
+                file.unlink()
+
 if __name__ == '__main__':
     import json
     import argparse
@@ -227,7 +272,13 @@ if __name__ == '__main__':
     parser.add_argument('--exclude', dest='exclude', action='store', nargs='*',
                         help="Exclude matching directories", default=[]
                        )
-    parser.add_argument('--format', dest='format', choices=['txt', 'json'], action='store',
+    parser.add_argument('--rmfrom', dest='rmfrom', type=pathlib.Path, action='store',
+                        help="Remove duplicates under path", default=None
+                       )
+    parser.add_argument('--rmre', dest='rmre', type=str, action='store',
+                        help="Remove duplicates matching the regular expression", default=None
+                       )
+    parser.add_argument('--format', dest='format', choices=['txt', 'json', 'quiet'], action='store',
                         help="Output format. Text is default", default='txt'
                        ) 
     parser.add_argument('--verbose', dest='verbose', action='store_true',
@@ -235,7 +286,9 @@ if __name__ == '__main__':
                        ) 
     parser.add_argument('--debug', dest='debug', action='store_true',
                         help="Debug level logging"
-                       ) 
+                       )
+    parser.add_argument('--minsize', dest='minsize', type=int, action='store',
+                        help="Minimum file size to consider", default=0)
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG)
@@ -249,13 +302,21 @@ if __name__ == '__main__':
     else:
         logger.setLevel(logging.ERROR)
 
-    dups = dupfinder(args.path, args.exclude)
+    dups = dupfinder(args.path, args.exclude, minsize=args.minsize)
 
     if args.format == 'json':
         print(json.dumps(dups, indent=4))
+    elif args.format == 'quiet':
+        pass
     else:
-        for hash, list in dups.items():
-            print('┏', list[0])
-            for file in list[1:len(list)-1]:
+        for hash, filelist in dups.items():
+            print('┏', filelist[0])
+            for file in filelist[1:len(filelist)-1]:
                print('┃', file)
-            print('┗', list[-1])
+            print('┗', filelist[-1])
+
+    if args.rmfrom:
+        rmduplicatesfrom(args.rmfrom, dups)
+
+    if args.rmre:
+        rmduplicatesre(args.rmre, dups)

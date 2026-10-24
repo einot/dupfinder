@@ -1,0 +1,47 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }} / ${{ matrix.hash }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
+        # 'blake3' installs the optional blake3 package, 'sha256' runs on the standard library alone
+        hash: [blake3, sha256]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install blake3
+        if: matrix.hash == 'blake3'
+        run: python -m pip install blake3
+
+      - name: Check the default hash
+        env:
+          EXPECTED_HASH: ${{ matrix.hash }}
+        run: |
+          python -c "import dupfinder, os, sys; print('default hash:', dupfinder.DEFAULT_HASH); sys.exit(dupfinder.DEFAULT_HASH != os.environ['EXPECTED_HASH'])"
+
+      - name: Run tests
+        run: python -m unittest -v

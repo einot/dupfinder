@@ -27,11 +27,12 @@ SOFTWARE.
 __author__ = "Eino Tuominen <eino@utu.fi>"
 __copyright__ = "Copyright (C) 2021 Eino Tuominen"
 __license__ = "MIT License"
-__version__ = "1.2"
+__version__ = "1.3"
 
 from typing import List, Dict, Tuple, Optional, Generator, Union
 from collections import Counter
 
+import logging
 import os
 import stat
 import sys
@@ -45,10 +46,12 @@ BLOCKSIZE = 4096
 # chunks double in size from one block up to this
 MAXCHUNK = 8 * 1024 * 1024
 
+logger = logging.getLogger('dupfinder')
+
 def warn(error: OSError) -> None:
     """Reports a file that could not be processed and carries on"""
 
-    print(f"dupfinder: {error}", file=sys.stderr)
+    logger.warning("%s", error)
 
 def readrange(filename: str, offset: int, length: int, stats: Counter) -> Optional[bytes]:
     """Reads a byte range of a file
@@ -88,7 +91,7 @@ def readrange(filename: str, offset: int, length: int, stats: Counter) -> Option
     stats['reads'] += 1
     stats['bytes_read'] += length - remaining
     if remaining:
-        print(f"dupfinder: {filename}: changed during scan, skipped", file=sys.stderr)
+        logger.warning("%s: changed during scan, skipped", filename)
         return None
     return b''.join(parts)
 
@@ -193,10 +196,12 @@ def lockstep(files: List[str], size: int, stats: Counter) -> Dict[str, List[str]
         for filename in group:
             hashes[filename].update(tails[filename])
             duplicates.setdefault(hashes[filename].hexdigest(), []).append(filename)
+    logger.debug("size %d: %d files, %d duplicates", size, len(files),
+                 sum(map(len, duplicates.values())))
     return duplicates
 
 def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None,
-              stats: Optional[Counter] = None) -> Dict[str, List[str]]:
+              stats: Optional[Counter] = None, minsize: int = 0) -> Dict[str, List[str]]:
     """Returns duplicate files
 
     Walks through a file path and finds duplicates by comparing hash digests of the files.
@@ -204,8 +209,8 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
     files with a unique size are never read. Each size group is then read in step, see
     lockstep(). No byte of any file is read more than once.
 
-    Empty files are ignored, and hard links to the same file are counted once,
-    as they do not take up extra space.
+    Empty files and files smaller than minsize are ignored, and hard links to
+    the same file are counted once, as they do not take up extra space.
 
     Args:
       path:
@@ -215,6 +220,8 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
       stats:
         Optional Counter that receives the number of files seen, candidate
         files and bytes, read calls, bytes read, and duplicate files and bytes
+      minsize:
+        Ignore files smaller than this many bytes
     Returns:
       A dict of duplicates. The keys are sha256 digests of the files. Format:
       {hashdigest1: [filepath1, filepath2],
@@ -229,15 +236,17 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
     inodes = set()
     for filename, st in filewalker(path, exclude=exclude):
         stats['files'] += 1
-        if st.st_size == 0 or (st.st_dev, st.st_ino) in inodes:
+        if st.st_size < max(minsize, 1) or (st.st_dev, st.st_ino) in inodes:
             continue
         inodes.add((st.st_dev, st.st_ino))
         sizes.setdefault(st.st_size, []).append(filename)
 
+    groups = {size: files for size, files in sizes.items() if len(files) > 1}
+    logger.info("%d files seen, %d to compare in %d size groups", stats['files'],
+                sum(map(len, groups.values())), len(groups))
+
     dups: Dict[str, List[str]] = {}
-    for size, files in sizes.items():
-        if len(files) < 2:
-            continue
+    for size, files in groups.items():
         stats['candidates'] += len(files)
         stats['candidate_bytes'] += size * len(files)
         for digest, group in lockstep(files, size, stats).items():
@@ -257,9 +266,26 @@ def humansize(n: int) -> str:
         if n < 1024 or unit == 'TiB':
             return f"{n:.1f} {unit}"
 
+def parsesize(text: str) -> int:
+    """Parses a byte count with an optional K, M, G or T suffix, e.g. 10M"""
+
+    units = {'': 1, 'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3, 'T': 1024 ** 4}
+    number = text.strip().upper().removesuffix('IB').removesuffix('B')
+    unit = number[-1:] if number[-1:] in units else ''
+    try:
+        return int(float(number[:len(number) - len(unit)]) * units[unit])
+    except ValueError:
+        raise ValueError(f"invalid size: {text}") from None
+
 if __name__ == '__main__':
     import json
     import argparse
+
+    def size(text: str) -> int:
+        try:
+            return parsesize(text)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e))
 
     parser = argparse.ArgumentParser(description='Find duplicate files within a path')
     parser.add_argument('--path', dest='path', type=pathlib.Path,
@@ -269,20 +295,32 @@ if __name__ == '__main__':
                         help="Exclude directories with matching names (wildcards allowed)",
                         default=[]
                        )
-    parser.add_argument('--format', dest='format', choices=['txt', 'json'], action='store',
-                        help="Output format. Text is default", default='txt'
+    parser.add_argument('--format', dest='format', choices=['txt', 'json', 'quiet'], action='store',
+                        help="Output format. Text is default, quiet prints nothing", default='txt'
+                       )
+    parser.add_argument('--minsize', dest='minsize', type=size, action='store',
+                        help="Ignore files smaller than this, e.g. 4096, 100K or 1.5M", default=0
                        )
     parser.add_argument('--stats', dest='stats', action='store_true',
                         help="Print read statistics to stderr"
                        )
+    parser.add_argument('--verbose', dest='verbose', action='store_true',
+                        help="Verbose logging"
+                       )
+    parser.add_argument('--debug', dest='debug', action='store_true',
+                        help="Debug level logging"
+                       )
     args = parser.parse_args()
 
+    level = logging.DEBUG if args.debug else logging.INFO if args.verbose else logging.WARNING
+    logging.basicConfig(format='dupfinder: %(message)s', level=level)
+
     stats: Counter = Counter()
-    dups = dupfinder(args.path, args.exclude, stats)
+    dups = dupfinder(args.path, args.exclude, stats, minsize=args.minsize)
 
     if args.format == 'json':
         print(json.dumps(dups, indent=4))
-    else:
+    elif args.format == 'txt':
         for files in dups.values():
             print('┏', files[0])
             for file in files[1:-1]:

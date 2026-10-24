@@ -2,7 +2,7 @@
 Find duplicate files under a directory path
 
     $ ./dupfinder --help
-    usage: dupfinder [-h] [--path PATH] [--exclude [EXCLUDE ...]] [--format {txt,json}]
+    usage: dupfinder [-h] [--path PATH] [--exclude [EXCLUDE ...]] [--format {txt,json}] [--stats]
     
     Find duplicate files within a path
 
@@ -13,3 +13,4 @@ Find duplicate files under a directory path
                             Exclude directories with matching names (wildcards
                             allowed)
       --format {txt,json}   Output format. Text is default
+      --stats               Print read statistics to stderr

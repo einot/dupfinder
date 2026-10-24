@@ -27,9 +27,10 @@ SOFTWARE.
 __author__ = "Eino Tuominen <eino@utu.fi>"
 __copyright__ = "Copyright (C) 2021 Eino Tuominen"
 __license__ = "MIT License"
-__version__ = "1.1"
+__version__ = "1.2"
 
 from typing import List, Dict, Tuple, Optional, Generator, Union
+from collections import Counter
 
 import os
 import stat
@@ -38,51 +39,58 @@ from fnmatch import fnmatch
 from hashlib import sha256
 import pathlib
 
-# one disk block
-SCANSIZE = 4096
+# one disk block; the size of the first chunk and of the tail block
+BLOCKSIZE = 4096
 
-# read buffer for hashing whole files
-CHUNKSIZE = 1024 * 1024
+# chunks double in size from one block up to this
+MAXCHUNK = 8 * 1024 * 1024
 
 def warn(error: OSError) -> None:
     """Reports a file that could not be processed and carries on"""
 
     print(f"dupfinder: {error}", file=sys.stderr)
 
-def hasher(*files, scansize, hashfunc) -> Generator[Tuple[str, str], None, None]:
-    """Calculates hashes for files
+def readrange(filename: str, offset: int, length: int, stats: Counter) -> Optional[bytes]:
+    """Reads a byte range of a file
 
-    A generator function to calculate hashes for a list of files.
-    Files that cannot be read are reported on stderr and skipped.
+    Reads unbuffered, so that no more than the requested range is read.
+    A file that cannot be read, or that is shorter than expected because
+    it changed during the scan, is reported on stderr.
 
     Args:
-      files:
-        List of file paths
-      scansize:
-        Read scansize bytes from the beginning of the file.
-        If scansize = 0, process the whole file.
-      hashfunc:
-        Hash function to use for calculation
+      filename:
+        File path
+      offset:
+        Where to start reading
+      length:
+        Number of bytes to read
+      stats:
+        Counter for bytes read and read calls
 
-    Yields:
-      A tuple which is a pair (hash, filename).
+    Returns:
+      The bytes, or None if the range could not be read.
     """
 
-    for filename in files:
-        try:
-            with open(filename, 'rb') as file:
-                if scansize:
-                    d = file.read(scansize)
-                    x = hashfunc(d).hexdigest()
-                else:
-                    xx = hashfunc()
-                    for byte_block in iter(lambda: file.read(CHUNKSIZE), b""):
-                        xx.update(byte_block)
-                    x = xx.hexdigest()
-        except OSError as e:
-            warn(e)
-            continue
-        yield x, filename
+    parts = []
+    remaining = length
+    try:
+        with open(filename, 'rb', buffering=0) as file:
+            file.seek(offset)
+            while remaining:
+                data = file.read(remaining)
+                if not data:
+                    break
+                parts.append(data)
+                remaining -= len(data)
+    except OSError as e:
+        warn(e)
+        return None
+    stats['reads'] += 1
+    stats['bytes_read'] += length - remaining
+    if remaining:
+        print(f"dupfinder: {filename}: changed during scan, skipped", file=sys.stderr)
+        return None
+    return b''.join(parts)
 
 def filewalker(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
               ) -> Generator[Tuple[str, os.stat_result], None, None]:
@@ -118,50 +126,83 @@ def filewalker(path: Union[str, os.PathLike], exclude: Optional[List[str]] = Non
                 continue
             yield fpath, st
 
-def duplicates(*files, scansize, hashfunc) -> Dict[str, List[str]]:
-    """Returns a duplicate files
+def lockstep(files: List[str], size: int, stats: Counter) -> Dict[str, List[str]]:
+    """Returns duplicates among files of equal size
 
-    Returns a dict that contains filenames that have identical
-    hash digests.
+    Reads the files in step, chunk by chunk, keeping a running sha256 for
+    each file, and splits the group whenever the files' hashes so far
+    differ. A file is dropped as soon as no other file matches it, so
+    files that differ are read only up to the chunk where they differ,
+    and identical files are read exactly once.
+
+    The last block is read first, because many file formats keep an index
+    at the end that differs whenever the contents differ. It is held in
+    memory and fed to the hash when the sequential reads reach it, so no
+    byte is read twice. Chunks start at one block and double up to
+    MAXCHUNK, so most differing files are dropped cheaply while identical
+    files are streamed in large reads.
 
     Args:
       files:
-        A list of files to compare
-      scansize:
-        Read scansize bytes from the beginning of the file.
-        If scansize = 0, process the whole file.
-      hashfunc:
-        Hash function to use for calculation
+        A list of files of equal size
+      size:
+        Size of the files in bytes
+      stats:
+        Counter for bytes read and read calls
 
     Returns:
-      A dict containing duplicate hash digests. Format
+      A dict containing duplicate sha256 digests. Format
       {hashdigest1: [filepath1, filepath2],
        ...
       }
     """
 
-    candidates: Dict[str, str] = {}
-    duplicates: Dict[str, List[str]] = {}
+    # Tail block
+    tailstart = max(0, size - BLOCKSIZE)
+    tails: Dict[str, bytes] = {}
+    buckets: Dict[bytes, List[str]] = {}
+    for filename in files:
+        data = readrange(filename, tailstart, size - tailstart, stats)
+        if data is not None:
+            tails[filename] = data
+            buckets.setdefault(data, []).append(filename)
+    groups = [group for group in buckets.values() if len(group) > 1]
 
-    for digest, filename in hasher(*files, scansize=scansize, hashfunc=hashfunc):
-        if digest in duplicates:
-            duplicates[digest].append(filename)
-        elif digest in candidates:
-            duplicates[digest] = [candidates[digest], filename]
-        else:
-            candidates[digest] = filename
+    # Sequential chunks up to the tail block
+    hashes = {filename: sha256() for group in groups for filename in group}
+    offset, chunk = 0, BLOCKSIZE
+    while offset < tailstart and groups:
+        length = min(chunk, tailstart - offset)
+        refined = []
+        for group in groups:
+            buckets = {}
+            for filename in group:
+                data = readrange(filename, offset, length, stats)
+                if data is None:
+                    continue
+                hashes[filename].update(data)
+                buckets.setdefault(hashes[filename].copy().digest(), []).append(filename)
+            refined += [g for g in buckets.values() if len(g) > 1]
+        groups = refined
+        offset += length
+        chunk = min(2 * chunk, MAXCHUNK)
+
+    # Feed the held tail blocks to complete the full-file hashes
+    duplicates: Dict[str, List[str]] = {}
+    for group in groups:
+        for filename in group:
+            hashes[filename].update(tails[filename])
+            duplicates.setdefault(hashes[filename].hexdigest(), []).append(filename)
     return duplicates
 
-def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
-             ) -> Dict[str, List[str]]:
+def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None,
+              stats: Optional[Counter] = None) -> Dict[str, List[str]]:
     """Returns duplicate files
 
     Walks through a file path and finds duplicates by comparing hash digests of the files.
     Only files of equal size can be duplicates, so files are first grouped by size and
-    files with a unique size are never read. Within a size group, the first pass scans
-    a little from the beginning of the file, the second pass scans a bigger part of the
-    file for the colliding files, and the last pass calculates full sha256 sums. A pass
-    that would read the whole file anyway is skipped. Returns found duplicates.
+    files with a unique size are never read. Each size group is then read in step, see
+    lockstep(). No byte of any file is read more than once.
 
     Empty files are ignored, and hard links to the same file are counted once,
     as they do not take up extra space.
@@ -171,16 +212,23 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
         Path name to scan
       exclude:
         list of directory names or patterns to exclude
+      stats:
+        Optional Counter that receives the number of files seen, candidate
+        files and bytes, read calls, bytes read, and duplicate files and bytes
     Returns:
-      A dict of duplicates. Format:
+      A dict of duplicates. The keys are sha256 digests of the files. Format:
       {hashdigest1: [filepath1, filepath2],
        ...
       }
     """
 
+    if stats is None:
+        stats = Counter()
+
     sizes: Dict[int, List[str]] = {}
     inodes = set()
     for filename, st in filewalker(path, exclude=exclude):
+        stats['files'] += 1
         if st.st_size == 0 or (st.st_dev, st.st_ino) in inodes:
             continue
         inodes.add((st.st_dev, st.st_ino))
@@ -190,21 +238,24 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
     for size, files in sizes.items():
         if len(files) < 2:
             continue
-
-        # Partial passes, refining the groups of colliding files
-        groups = [files]
-        for scansize in (SCANSIZE, 100*SCANSIZE):
-            if scansize >= size:
-                break
-            groups = [refined for group in groups
-                      for refined in duplicates(*group, scansize=scansize,
-                                                hashfunc=sha256).values()]
-
-        # Full pass
-        for group in groups:
-            dups.update(duplicates(*group, scansize=0, hashfunc=sha256))
+        stats['candidates'] += len(files)
+        stats['candidate_bytes'] += size * len(files)
+        for digest, group in lockstep(files, size, stats).items():
+            stats['duplicates'] += len(group)
+            stats['duplicate_bytes'] += size * len(group)
+            dups[digest] = group
 
     return dups
+
+def humansize(n: int) -> str:
+    """Formats a byte count, e.g. 1.5 MiB"""
+
+    if n < 1024:
+        return f"{n} B"
+    for unit in ('KiB', 'MiB', 'GiB', 'TiB'):
+        n /= 1024
+        if n < 1024 or unit == 'TiB':
+            return f"{n:.1f} {unit}"
 
 if __name__ == '__main__':
     import json
@@ -221,9 +272,13 @@ if __name__ == '__main__':
     parser.add_argument('--format', dest='format', choices=['txt', 'json'], action='store',
                         help="Output format. Text is default", default='txt'
                        )
+    parser.add_argument('--stats', dest='stats', action='store_true',
+                        help="Print read statistics to stderr"
+                       )
     args = parser.parse_args()
 
-    dups = dupfinder(args.path, args.exclude)
+    stats: Counter = Counter()
+    dups = dupfinder(args.path, args.exclude, stats)
 
     if args.format == 'json':
         print(json.dumps(dups, indent=4))
@@ -233,3 +288,14 @@ if __name__ == '__main__':
             for file in files[1:-1]:
                 print('┃', file)
             print('┗', files[-1])
+
+    if args.stats:
+        share = stats['bytes_read'] / stats['candidate_bytes'] if stats['candidate_bytes'] else 0
+        print(f"files seen:       {stats['files']}\n"
+              f"candidates:       {stats['candidates']} files, "
+              f"{humansize(stats['candidate_bytes'])} (same size as another file)\n"
+              f"duplicates:       {stats['duplicates']} files in {len(dups)} groups, "
+              f"{humansize(stats['duplicate_bytes'])}\n"
+              f"bytes read:       {humansize(stats['bytes_read'])} "
+              f"({share:.1%} of candidate bytes) in {stats['reads']} reads",
+              file=sys.stderr)

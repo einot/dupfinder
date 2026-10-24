@@ -1,0 +1,42 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SCOPE_AGENT_TYPES='architect' PATH_ROOT='project' ALLOW_GLOBS='docs/* README.md' DENY_GLOBS='.claude .claude/* */.claude */.claude/* CLAUDE.md */CLAUDE.md CLAUDE.local.md */CLAUDE.local.md .mcp.json */.mcp.json' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SCOPE_AGENT_TYPES='coder' PATH_ROOT='cwd' EXEMPT_GLOBS='Makefile' DENY_GLOBS='tests tests/* */tests */tests/* docs docs/* README.md CHANGES .github/workflows .github/workflows/* .claude .claude/* */.claude */.claude/* CLAUDE.md */CLAUDE.md CLAUDE.local.md */CLAUDE.local.md .mcp.json */.mcp.json /* ../* */../* .git .git/* */.git */.git/* .venv/* */.venv/* __pycache__/* */__pycache__/* conftest.py */conftest.py test*.py */test*.py *_test.py test*.txt */test*.txt unittest unittest/* unittest.py blake3 blake3/* blake3.py pytest.toml */pytest.toml .pytest.toml */.pytest.toml pytest.ini */pytest.ini .pytest.ini */.pytest.ini tox.ini */tox.ini setup.cfg */setup.cfg mypy.ini */mypy.ini .mypy.ini */.mypy.ini .ruff.toml */.ruff.toml */ruff.toml uv.toml */uv.toml .python-version */.python-version sitecustomize.py */sitecustomize.py usercustomize.py */usercustomize.py pytest pytest/* ruff ruff/* mypy mypy/* GNUmakefile makefile uv.lock' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SCOPE_AGENT_TYPES='test-author' PATH_ROOT='project' ALLOW_GLOBS='tests/*' DENY_GLOBS='.claude .claude/* */.claude */.claude/* CLAUDE.md */CLAUDE.md CLAUDE.local.md */CLAUDE.local.md .mcp.json */.mcp.json .git .git/* */.git */.git/* .venv/* */.venv/* __pycache__/* */__pycache__/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SCOPE_AGENT_TYPES='test-author' PATH_ROOT='project' ALLOW_GLOBS='README.md LICENSE docs docs/* tests tests/*' DENY_GLOBS='.claude .claude/* */.claude */.claude/* .git .git/* */.git */.git/*' ${CLAUDE_PROJECT_DIR}/.claude/hooks/path-guard.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

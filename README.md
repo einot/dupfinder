@@ -10,5 +10,6 @@ Find duplicate files under a directory path
       -h, --help            show this help message and exit
       --path PATH           Process path
       --exclude [EXCLUDE ...]
-                            Exclude matching directories
+                            Exclude directories with matching names (wildcards
+                            allowed)
       --format {txt,json}   Output format. Text is default

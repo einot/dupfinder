@@ -204,6 +204,81 @@ class TestWalk(TreeCase):
                          [['big1', 'big2']])
 
 
+class TestDelete(TreeCase):
+
+    def scan(self):
+        snapshots = {}
+        return df.dupfinder(self.root, snapshots=snapshots), snapshots
+
+    def remaining(self):
+        return sorted(os.path.relpath(os.path.join(d, f), self.root)
+                      for d, _, files in os.walk(self.root) for f in files)
+
+    def test_rmfrom_keeps_copies_elsewhere_and_dry_run_deletes_nothing(self):
+        self.write('keep/a', b'one')
+        self.write('trash/a', b'one')
+        self.write('trash/b', b'two')  # no copy anywhere, so not a duplicate
+        dups, snapshots = self.scan()
+        plan = list(df.deletions(dups, df.under(os.path.join(self.root, 'trash'))))
+        self.assertEqual(df.rmduplicates(plan, snapshots), plan)
+        self.assertEqual(self.remaining(), ['keep/a', 'trash/a', 'trash/b'])
+        stats = Counter()
+        df.rmduplicates(plan, snapshots, delete=True, stats=stats)
+        self.assertEqual(self.remaining(), ['keep/a', 'trash/b'])
+        self.assertEqual((stats['deleted'], stats['deleted_bytes']), (1, 3))
+
+    def test_one_copy_is_kept_when_all_are_selected(self):
+        for name in ('x/deep/c', 'x/b', 'x/a'):
+            self.write(name, b'same')
+        dups, snapshots = self.scan()
+        df.rmduplicates(df.deletions(dups, df.under(self.root)), snapshots, delete=True)
+        self.assertEqual(self.remaining(), ['x/a'], "the shallowest, then first in sort order")
+
+    def test_combined_tests_never_remove_every_copy(self):
+        # the local version ran --rmfrom and --rmre one after the other on the same
+        # duplicate list, so together they could delete both copies
+        self.write('trash/a', b'same')
+        self.write('keep/a.bak', b'same')
+        dups, snapshots = self.scan()
+        tests = [df.under(os.path.join(self.root, 'trash')), df.matching(r'\.bak$')]
+        plan = df.deletions(dups, lambda f: any(t(f) for t in tests))
+        self.assertEqual(len(df.rmduplicates(plan, snapshots, delete=True)), 1)
+        self.assertEqual(len(self.remaining()), 1)
+
+    def test_rmre_matches_file_names_only(self):
+        self.write('photos.bak/a', b'same')
+        self.write('photos/a copy', b'same')
+        dups, snapshots = self.scan()
+        plan = list(df.deletions(dups, df.matching(r'\.bak|copy$')))
+        self.assertEqual([os.path.relpath(f, self.root) for f, _ in plan], ['photos/a copy'])
+
+    def test_changed_or_missing_files_are_not_deleted(self):
+        for change in ('modify doomed', 'modify keeper', 'remove keeper', 'replace doomed'):
+            with self.subTest(change):
+                doomed = self.write('trash/a', b'same')
+                keeper = self.write('keep/a', b'same')
+                dups, snapshots = self.scan()
+                plan = list(df.deletions(dups, df.under(os.path.join(self.root, 'trash'))))
+                if change == 'modify doomed':
+                    self.write('trash/a', b'SAME')
+                elif change == 'modify keeper':
+                    st = os.stat(keeper)
+                    os.utime(keeper, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
+                elif change == 'remove keeper':
+                    os.unlink(keeper)
+                else:
+                    os.unlink(doomed)
+                    self.write('trash/a', b'same')  # same content, but a different file now
+                stats = Counter()
+                with self.assertLogs('dupfinder', 'WARNING'):
+                    self.assertEqual(df.rmduplicates(plan, snapshots, delete=True, stats=stats), [])
+                self.assertTrue(os.path.exists(doomed))
+                self.assertEqual(stats['skipped'], 1)
+                for f in (doomed, keeper):
+                    if os.path.exists(f):
+                        os.unlink(f)
+
+
 class TestCli(TreeCase):
 
     def setUp(self):
@@ -237,6 +312,24 @@ class TestCli(TreeCase):
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 2)
             self.assertIn('blake3 is not installed', result.stderr)
+
+    def test_delete_options(self):
+        trash = os.path.join(self.root, 'trash')
+        self.write('trash/b', b'data')
+        result = self.cli('--format', 'quiet', '--rmfrom', trash)
+        self.assertIn('would delete', result.stdout)
+        self.assertIn('add --delete', result.stderr)
+        self.assertTrue(os.path.exists(os.path.join(trash, 'b')))
+        result = self.cli('--format', 'json', '--rmfrom', trash, '--delete', '--stats')
+        json.loads(result.stdout)  # report went to stderr, JSON stays valid
+        self.assertIn('deleted:          1 files, 4 B; 0 skipped', result.stderr)
+        self.assertFalse(os.path.exists(os.path.join(trash, 'b')))
+        self.assertTrue(os.path.exists(os.path.join(self.root, 'a')))
+        for args, message in [(['--delete'], '--delete needs'), (['--rmre', '('], '--rmre:')]:
+            result = subprocess.run([sys.executable, SCRIPT, '--path', self.root, *args],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(message, result.stderr)
 
     def test_parsesize(self):
         for text, value in [('100', 100), ('4k', 4096), ('1.5M', 1536 * 1024), ('2GiB', 2 << 30), ('10MB', 10 << 20)]:

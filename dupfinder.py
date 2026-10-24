@@ -27,14 +27,15 @@ SOFTWARE.
 __author__ = "Eino Tuominen <eino@utu.fi>"
 __copyright__ = "Copyright (C) 2021 Eino Tuominen"
 __license__ = "MIT License"
-__version__ = "1.5"
+__version__ = "1.6"
 
-from typing import List, Dict, Tuple, Optional, Generator, Union, Callable
+from typing import List, Dict, Tuple, Optional, Generator, Union, Callable, Iterable
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 import logging
 import os
+import re
 import stat
 import sys
 from fnmatch import fnmatch
@@ -222,7 +223,8 @@ def lockstep(files: List[str], size: int, stats: Counter,
 
 def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None,
               stats: Optional[Counter] = None, minsize: int = 0,
-              hashfunc: Optional[Callable] = None, jobs: int = 1) -> Dict[str, List[str]]:
+              hashfunc: Optional[Callable] = None, jobs: int = 1,
+              snapshots: Optional[Dict[str, os.stat_result]] = None) -> Dict[str, List[str]]:
     """Returns duplicate files
 
     Walks through a file path and finds duplicates by comparing hash digests of the files.
@@ -252,6 +254,9 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
         installed, else sha256
       jobs:
         Number of size groups to compare at the same time
+      snapshots:
+        Optional dict that receives the stat result of each compared file,
+        taken before reading it; rmduplicates() uses it to notice changes
     Returns:
       A dict of duplicates. The keys are hex digests of the files, matching
       sha256sum or b3sum output. Format:
@@ -273,6 +278,8 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
             continue
         inodes.add((st.st_dev, st.st_ino))
         sizes.setdefault(st.st_size, []).append(filename)
+        if snapshots is not None:
+            snapshots[filename] = st
 
     # Biggest groups first, so that parallel jobs finish close together
     groups = sorted(((size, files) for size, files in sizes.items() if len(files) > 1),
@@ -303,6 +310,100 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
             pool.shutdown(cancel_futures=True)
 
     return dups
+
+def under(path: Union[str, os.PathLike]) -> Callable[[str], bool]:
+    """Returns a test for files below path, for rmduplicates()"""
+
+    root = pathlib.Path(path).resolve()
+    return lambda filename: root in pathlib.Path(filename).resolve().parents
+
+def matching(expression: str) -> Callable[[str], bool]:
+    """Returns a test for file names (not directories) matching a regular expression"""
+
+    pattern = re.compile(expression)
+    return lambda filename: pattern.search(os.path.basename(filename)) is not None
+
+def deletions(dups: Dict[str, List[str]], select: Callable[[str], bool]
+             ) -> Generator[Tuple[str, str], None, None]:
+    """Plans which duplicates to delete
+
+    In each group, the files that select() accepts are deleted and the others
+    kept. If it accepts every file of a group, one is kept anyway: the one
+    nearest the root of the file system, and of those the first in sort order.
+    All selections are made on the whole group at once, so no combination of
+    tests can remove every copy.
+
+    Yields:
+      Pairs (file to delete, a copy that is kept).
+    """
+
+    for files in dups.values():
+        doomed = [f for f in files if select(f)]
+        kept = [f for f in files if f not in doomed]
+        if not doomed:
+            continue
+        if not kept:
+            keeper = min(doomed, key=lambda f: (len(pathlib.Path(f).resolve().parts), f))
+            doomed.remove(keeper)
+            kept = [keeper]
+        for filename in doomed:
+            yield filename, kept[0]
+
+def unchanged(filename: str, snapshot: Optional[os.stat_result]) -> bool:
+    """Tells if a file is still the same regular file, size and mtime as when it was scanned"""
+
+    try:
+        st = os.lstat(filename)
+    except OSError:
+        return False
+    return (snapshot is not None and stat.S_ISREG(st.st_mode)
+            and (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+             == (snapshot.st_dev, snapshot.st_ino, snapshot.st_size, snapshot.st_mtime_ns))
+
+def rmduplicates(plan: Iterable[Tuple[str, str]], snapshots: Dict[str, os.stat_result],
+                 delete: bool = False, stats: Optional[Counter] = None) -> List[Tuple[str, str]]:
+    """Deletes duplicates, or with delete=False only tells what would be deleted
+
+    Just before each deletion, both the file and the copy that is kept are
+    checked against their snapshots from the scan. If either has changed,
+    moved or disappeared since, the file is not deleted.
+
+    Args:
+      plan:
+        Pairs (file to delete, copy that is kept), see deletions()
+      snapshots:
+        Stat results from the scan, see dupfinder()
+      delete:
+        Really delete; otherwise only report
+      stats:
+        Optional Counter that receives the number and bytes of files deleted
+        (or that would be), and of files skipped
+
+    Returns:
+      Pairs (file deleted or that would be, copy kept).
+    """
+
+    if stats is None:
+        stats = Counter()
+    done = []
+    for filename, keeper in plan:
+        if not (unchanged(filename, snapshots.get(filename))
+                and unchanged(keeper, snapshots.get(keeper))):
+            logger.warning("%s: it or its copy %s changed since the scan, not deleted",
+                           filename, keeper)
+            stats['skipped'] += 1
+            continue
+        if delete:
+            try:
+                os.unlink(filename)
+            except OSError as e:
+                warn(e)
+                stats['skipped'] += 1
+                continue
+        stats['deleted'] += 1
+        stats['deleted_bytes'] += snapshots[filename].st_size
+        done.append((filename, keeper))
+    return done
 
 def humansize(n: int) -> str:
     """Formats a byte count, e.g. 1.5 MiB"""
@@ -357,6 +458,17 @@ if __name__ == '__main__':
                         help="Hash function. Default blake3 if installed, else sha256",
                         default=DEFAULT_HASH
                        )
+    parser.add_argument('--rmfrom', dest='rmfrom', type=pathlib.Path, action='store',
+                        help="Select duplicates under this path for deletion", default=None
+                       )
+    parser.add_argument('--rmre', dest='rmre', type=str, action='store',
+                        help="Select duplicates whose file name matches this regular expression "
+                             "for deletion", default=None
+                       )
+    parser.add_argument('--delete', dest='delete', action='store_true',
+                        help="Really delete the selected duplicates. Without it, only list them. "
+                             "One copy of each file is always kept"
+                       )
     parser.add_argument('--stats', dest='stats', action='store_true',
                         help="Print read statistics to stderr"
                        )
@@ -371,13 +483,20 @@ if __name__ == '__main__':
         parser.error("--jobs must be at least 1")
     if args.hash not in HASHES:
         parser.error(f"{args.hash} is not installed; pip install {args.hash}")
+    if args.delete and not (args.rmfrom or args.rmre):
+        parser.error("--delete needs --rmfrom or --rmre to select what to delete")
+    try:
+        tests = ([under(args.rmfrom)] if args.rmfrom else []) + ([matching(args.rmre)] if args.rmre else [])
+    except re.error as e:
+        parser.error(f"--rmre: {e}")
 
     level = logging.DEBUG if args.debug else logging.INFO if args.verbose else logging.WARNING
     logging.basicConfig(format='dupfinder: %(message)s', level=level)
 
     stats: Counter = Counter()
+    snapshots: Dict[str, os.stat_result] = {}
     dups = dupfinder(args.path, args.exclude, stats, minsize=args.minsize,
-                     hashfunc=HASHES[args.hash], jobs=args.jobs)
+                     hashfunc=HASHES[args.hash], jobs=args.jobs, snapshots=snapshots)
 
     if args.format == 'json':
         print(json.dumps(dups, indent=4))
@@ -387,6 +506,16 @@ if __name__ == '__main__':
             for file in files[1:-1]:
                 print('┃', file)
             print('┗', files[-1])
+
+    if tests:
+        plan = deletions(dups, lambda filename: any(test(filename) for test in tests))
+        # keep the JSON on stdout valid
+        out = sys.stderr if args.format == 'json' else sys.stdout
+        for filename, keeper in rmduplicates(plan, snapshots, delete=args.delete, stats=stats):
+            print(f"{'deleted' if args.delete else 'would delete'} {filename} (kept {keeper})", file=out)
+        if not args.delete and stats['deleted']:
+            print(f"dry run: {stats['deleted']} files, {humansize(stats['deleted_bytes'])}; "
+                  "add --delete to delete them", file=sys.stderr)
 
     if args.stats:
         share = stats['bytes_read'] / stats['candidate_bytes'] if stats['candidate_bytes'] else 0
@@ -398,3 +527,8 @@ if __name__ == '__main__':
               f"bytes read:       {humansize(stats['bytes_read'])} "
               f"({share:.1%} of candidate bytes) in {stats['reads']} reads",
               file=sys.stderr)
+        if tests:
+            label = 'deleted:' if args.delete else 'would delete:'
+            print(f"{label:18s}{stats['deleted']} files, "
+                  f"{humansize(stats['deleted_bytes'])}; {stats['skipped']} skipped",
+                  file=sys.stderr)

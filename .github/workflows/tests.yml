@@ -25,6 +25,18 @@ jobs:
         python: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
         # 'blake3' installs the optional blake3 package, 'sha256' runs on the standard library alone
         hash: [blake3, sha256]
+        # Python 3.9 is end of life and has no build for ubuntu-latest (26.04),
+        # but it is still macOS's system Python, so test it on Ubuntu 24.04
+        exclude:
+          - os: ubuntu-latest
+            python: '3.9'
+        include:
+          - os: ubuntu-24.04
+            python: '3.9'
+            hash: blake3
+          - os: ubuntu-24.04
+            python: '3.9'
+            hash: sha256
 
     steps:
       - uses: actions/checkout@v7

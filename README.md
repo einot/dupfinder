@@ -1,5 +1,6 @@
 # dupfinder
 [![Tests](https://github.com/einot/dupfinder/actions/workflows/tests.yml/badge.svg)](https://github.com/einot/dupfinder/actions/workflows/tests.yml)
+
 Find duplicate files under a directory path
 
     $ ./dupfinder --help

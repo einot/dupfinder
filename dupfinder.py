@@ -27,10 +27,11 @@ SOFTWARE.
 __author__ = "Eino Tuominen <eino@utu.fi>"
 __copyright__ = "Copyright (C) 2021 Eino Tuominen"
 __license__ = "MIT License"
-__version__ = "1.4"
+__version__ = "1.5"
 
 from typing import List, Dict, Tuple, Optional, Generator, Union, Callable
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import logging
 import os
@@ -49,6 +50,11 @@ try:
 except ImportError:
     pass
 DEFAULT_HASH = 'blake3' if 'blake3' in HASHES else 'sha256'
+
+# Size groups compared at the same time by default. More than the number of
+# physical cores slows blake3 down, and parallel reads of different files
+# thrash spinning disks, where --jobs 1 is better.
+DEFAULT_JOBS = min(4, os.cpu_count() or 1)
 
 # one disk block; the size of the first chunk and of the tail block
 BLOCKSIZE = 4096
@@ -216,13 +222,17 @@ def lockstep(files: List[str], size: int, stats: Counter,
 
 def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None,
               stats: Optional[Counter] = None, minsize: int = 0,
-              hashfunc: Optional[Callable] = None) -> Dict[str, List[str]]:
+              hashfunc: Optional[Callable] = None, jobs: int = 1) -> Dict[str, List[str]]:
     """Returns duplicate files
 
     Walks through a file path and finds duplicates by comparing hash digests of the files.
     Only files of equal size can be duplicates, so files are first grouped by size and
     files with a unique size are never read. Each size group is then read in step, see
     lockstep(). No byte of any file is read more than once.
+
+    With jobs > 1, that many size groups are compared at the same time in threads;
+    reading and hashing release the GIL, so they run in parallel. The groups with
+    the most bytes go first, and are also listed first in the result.
 
     Empty files and files smaller than minsize are ignored, and hard links to
     the same file are counted once, as they do not take up extra space.
@@ -240,6 +250,8 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
       hashfunc:
         Hash constructor; defaults to HASHES[DEFAULT_HASH], i.e. blake3 when
         installed, else sha256
+      jobs:
+        Number of size groups to compare at the same time
     Returns:
       A dict of duplicates. The keys are hex digests of the files, matching
       sha256sum or b3sum output. Format:
@@ -262,18 +274,33 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
         inodes.add((st.st_dev, st.st_ino))
         sizes.setdefault(st.st_size, []).append(filename)
 
-    groups = {size: files for size, files in sizes.items() if len(files) > 1}
+    # Biggest groups first, so that parallel jobs finish close together
+    groups = sorted(((size, files) for size, files in sizes.items() if len(files) > 1),
+                    key=lambda group: group[0] * len(group[1]), reverse=True)
     logger.info("%d files seen, %d to compare in %d size groups", stats['files'],
-                sum(map(len, groups.values())), len(groups))
+                sum(len(files) for _, files in groups), len(groups))
+
+    def compare(group: Tuple[int, List[str]]) -> Tuple[int, List[str], Counter, Dict[str, List[str]]]:
+        # each group counts into its own Counter, so threads share no state
+        size, files = group
+        groupstats: Counter = Counter()
+        return size, files, groupstats, lockstep(files, size, groupstats, hashfunc)
 
     dups: Dict[str, List[str]] = {}
-    for size, files in groups.items():
-        stats['candidates'] += len(files)
-        stats['candidate_bytes'] += size * len(files)
-        for digest, group in lockstep(files, size, stats, hashfunc).items():
-            stats['duplicates'] += len(group)
-            stats['duplicate_bytes'] += size * len(group)
-            dups[digest] = group
+    pool = ThreadPoolExecutor(max_workers=jobs) if jobs > 1 else None
+    try:
+        for size, files, groupstats, found in (pool.map if pool else map)(compare, groups):
+            stats.update(groupstats)
+            stats['candidates'] += len(files)
+            stats['candidate_bytes'] += size * len(files)
+            for digest, group in found.items():
+                stats['duplicates'] += len(group)
+                stats['duplicate_bytes'] += size * len(group)
+                dups[digest] = group
+    finally:
+        if pool:
+            # on Ctrl-C or an error, don't wait for the queued groups
+            pool.shutdown(cancel_futures=True)
 
     return dups
 
@@ -322,6 +349,10 @@ if __name__ == '__main__':
     parser.add_argument('--minsize', dest='minsize', type=size, action='store',
                         help="Ignore files smaller than this, e.g. 4096, 100K or 1.5M", default=0
                        )
+    parser.add_argument('--jobs', dest='jobs', type=int, action='store', default=DEFAULT_JOBS,
+                        help="Size groups to compare in parallel. Default min(4, CPUs); "
+                             "use 1 for spinning disks and network shares"
+                       )
     parser.add_argument('--hash', dest='hash', choices=['blake3', 'sha256'], action='store',
                         help="Hash function. Default blake3 if installed, else sha256",
                         default=DEFAULT_HASH
@@ -336,6 +367,8 @@ if __name__ == '__main__':
                         help="Debug level logging"
                        )
     args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
     if args.hash not in HASHES:
         parser.error(f"{args.hash} is not installed; pip install {args.hash}")
 
@@ -344,7 +377,7 @@ if __name__ == '__main__':
 
     stats: Counter = Counter()
     dups = dupfinder(args.path, args.exclude, stats, minsize=args.minsize,
-                     hashfunc=HASHES[args.hash])
+                     hashfunc=HASHES[args.hash], jobs=args.jobs)
 
     if args.format == 'json':
         print(json.dumps(dups, indent=4))

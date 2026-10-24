@@ -103,13 +103,14 @@ class TestLockstep(TreeCase):
                 self.write(f"f{n:04d}", data)
 
         for name, hashfunc in df.HASHES.items():
-            with self.subTest(hash=name):
-                self.check_against_brute_force(hashfunc)
+            for jobs in (1, 4):
+                with self.subTest(hash=name, jobs=jobs):
+                    self.check_against_brute_force(hashfunc, jobs)
 
-    def check_against_brute_force(self, hashfunc):
+    def check_against_brute_force(self, hashfunc, jobs):
         ranges = self.record_reads()
         stats = Counter()
-        dups = df.dupfinder(self.root, stats=stats, hashfunc=hashfunc)
+        dups = df.dupfinder(self.root, stats=stats, hashfunc=hashfunc, jobs=jobs)
 
         self.assertEqual(by_inode(dups), self.brute_force(hashfunc))
         for filename, reads in ranges.items():
@@ -125,6 +126,22 @@ class TestLockstep(TreeCase):
                                  os.path.getsize(filename), filename)
         self.assertEqual(stats['bytes_read'],
                          sum(length for reads in ranges.values() for _, length in reads))
+
+    def test_parallel_jobs_give_the_same_result_and_stats(self):
+        rng = random.Random(4)
+        for i in range(20):
+            data = rng.randbytes(1000 * (i + 1))
+            self.write(f"dup{i}a", data)
+            self.write(f"dup{i}b", data)
+            self.write(f"near{i}", flip(data, len(data) // 2))
+        results = {}
+        for jobs in (1, 2, 8):
+            stats = Counter()
+            results[jobs] = (list(df.dupfinder(self.root, stats=stats, jobs=jobs).items()), stats)
+        self.assertEqual(results[1], results[2])
+        self.assertEqual(results[1], results[8])
+        sizes = [os.path.getsize(files[0]) for _, files in results[1][0]]
+        self.assertEqual(sizes, sorted(sizes, reverse=True), "biggest groups first")
 
     def test_difference_at_the_end_costs_one_block(self):
         data = random.Random(2).randbytes(200003)

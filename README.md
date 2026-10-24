@@ -3,8 +3,8 @@ Find duplicate files under a directory path
 
     $ ./dupfinder --help
     usage: dupfinder [-h] [--path PATH] [--exclude [EXCLUDE ...]]
-                     [--format {txt,json,quiet}] [--minsize MINSIZE] [--stats]
-                     [--verbose] [--debug]
+                     [--format {txt,json,quiet}] [--minsize MINSIZE]
+                     [--hash {blake3,sha256}] [--stats] [--verbose] [--debug]
     
     Find duplicate files within a path
     
@@ -18,9 +18,17 @@ Find duplicate files under a directory path
                             Output format. Text is default, quiet prints nothing
       --minsize MINSIZE     Ignore files smaller than this, e.g. 4096, 100K or
                             1.5M
+      --hash {blake3,sha256}
+                            Hash function. Default blake3 if installed, else
+                            sha256
       --stats               Print read statistics to stderr
       --verbose             Verbose logging
       --debug               Debug level logging
+
+Needs Python 3.9 or newer and nothing else. For faster hashing, install
+[blake3](https://pypi.org/project/blake3/); it is then used by default:
+
+    $ pip install blake3
 
 ## Testing
 

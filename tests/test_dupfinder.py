@@ -18,6 +18,7 @@ sys.path.insert(0, ROOT)
 import dupfinder as df  # noqa: E402
 
 B = df.BLOCKSIZE
+READRANGE = df.readrange
 
 
 def flip(data: bytes, pos: int) -> bytes:
@@ -47,8 +48,8 @@ class TreeCase(unittest.TestCase):
             f.write(data)
         return path
 
-    def brute_force(self):
-        """Full sha256 of every regular non-empty file, one name per inode"""
+    def brute_force(self, hashfunc=hashlib.sha256):
+        """Full hash of every regular non-empty file, one name per inode"""
         groups = defaultdict(set)
         for dirpath, _, filenames in os.walk(self.root):
             for name in filenames:
@@ -57,7 +58,7 @@ class TreeCase(unittest.TestCase):
                 if os.path.islink(path) or st.st_size == 0:
                     continue
                 with open(path, 'rb') as f:
-                    groups[hashlib.sha256(f.read()).hexdigest()].add(st.st_ino)
+                    groups[hashfunc(f.read()).hexdigest()].add(st.st_ino)
         return {digest: frozenset(inodes) for digest, inodes in groups.items() if len(inodes) > 1}
 
     def cli(self, *args) -> subprocess.CompletedProcess:
@@ -77,11 +78,10 @@ class TestLockstep(TreeCase):
     def record_reads(self):
         """Patches readrange to log every (offset, length) read per file"""
         ranges = defaultdict(list)
-        real = df.readrange
 
         def recording(filename, offset, length, stats):
             ranges[filename].append((offset, length))
-            return real(filename, offset, length, stats)
+            return READRANGE(filename, offset, length, stats)
 
         patcher = mock.patch.object(df, 'readrange', recording)
         patcher.start()
@@ -102,11 +102,16 @@ class TestLockstep(TreeCase):
                 n += 1
                 self.write(f"f{n:04d}", data)
 
+        for name, hashfunc in df.HASHES.items():
+            with self.subTest(hash=name):
+                self.check_against_brute_force(hashfunc)
+
+    def check_against_brute_force(self, hashfunc):
         ranges = self.record_reads()
         stats = Counter()
-        dups = df.dupfinder(self.root, stats=stats)
+        dups = df.dupfinder(self.root, stats=stats, hashfunc=hashfunc)
 
-        self.assertEqual(by_inode(dups), self.brute_force())
+        self.assertEqual(by_inode(dups), self.brute_force(hashfunc))
         for filename, reads in ranges.items():
             size = os.path.getsize(filename)
             end = 0
@@ -129,11 +134,15 @@ class TestLockstep(TreeCase):
         self.assertEqual(df.dupfinder(self.root, stats=stats), {})
         self.assertEqual(stats['bytes_read'], 2 * B)
 
-    def test_keys_are_sha256_of_the_file(self):
+    def test_keys_are_hex_digests_of_the_file(self):
         data = random.Random(3).randbytes(50000)
         self.write('a', data)
         self.write('b', data)
-        self.assertEqual(list(df.dupfinder(self.root)), [hashlib.sha256(data).hexdigest()])
+        for name, hashfunc in df.HASHES.items():
+            with self.subTest(hash=name):
+                self.assertEqual(list(df.dupfinder(self.root, hashfunc=hashfunc)),
+                                 [hashfunc(data).hexdigest()])
+        self.assertEqual(list(df.dupfinder(self.root)), [df.HASHES[df.DEFAULT_HASH](data).hexdigest()])
 
 
 class TestWalk(TreeCase):
@@ -197,6 +206,20 @@ class TestCli(TreeCase):
         self.assertIn('duplicates:       2 files in 1 groups', result.stderr)
         result = self.cli('--format', 'quiet', '--stats', '--minsize', '1K')
         self.assertIn('candidates:       0 files', result.stderr)
+
+    def test_hash_option(self):
+        keys = json.loads(self.cli('--format', 'json', '--hash', 'sha256').stdout)
+        self.assertEqual(list(keys), [hashlib.sha256(b'data').hexdigest()])
+        if 'blake3' in df.HASHES:
+            self.assertEqual(df.DEFAULT_HASH, 'blake3')
+            keys = json.loads(self.cli('--format', 'json', '--hash', 'blake3').stdout)
+            self.assertEqual(list(keys), [df.HASHES['blake3'](b'data').hexdigest()])
+        else:
+            self.assertEqual(df.DEFAULT_HASH, 'sha256')
+            result = subprocess.run([sys.executable, SCRIPT, '--path', self.root, '--hash', 'blake3'],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('blake3 is not installed', result.stderr)
 
     def test_parsesize(self):
         for text, value in [('100', 100), ('4k', 4096), ('1.5M', 1536 * 1024), ('2GiB', 2 << 30), ('10MB', 10 << 20)]:

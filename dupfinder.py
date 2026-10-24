@@ -27,9 +27,9 @@ SOFTWARE.
 __author__ = "Eino Tuominen <eino@utu.fi>"
 __copyright__ = "Copyright (C) 2021 Eino Tuominen"
 __license__ = "MIT License"
-__version__ = "1.3"
+__version__ = "1.4"
 
-from typing import List, Dict, Tuple, Optional, Generator, Union
+from typing import List, Dict, Tuple, Optional, Generator, Union, Callable
 from collections import Counter
 
 import logging
@@ -39,6 +39,16 @@ import sys
 from fnmatch import fnmatch
 from hashlib import sha256
 import pathlib
+
+# Hash functions by name. blake3 is several times faster than sha256 but
+# needs the blake3 package (pip install blake3), so it is optional.
+HASHES: Dict[str, Callable] = {'sha256': sha256}
+try:
+    from blake3 import blake3
+    HASHES['blake3'] = blake3
+except ImportError:
+    pass
+DEFAULT_HASH = 'blake3' if 'blake3' in HASHES else 'sha256'
 
 # one disk block; the size of the first chunk and of the tail block
 BLOCKSIZE = 4096
@@ -129,10 +139,11 @@ def filewalker(path: Union[str, os.PathLike], exclude: Optional[List[str]] = Non
                 continue
             yield fpath, st
 
-def lockstep(files: List[str], size: int, stats: Counter) -> Dict[str, List[str]]:
+def lockstep(files: List[str], size: int, stats: Counter,
+             hashfunc: Callable = sha256) -> Dict[str, List[str]]:
     """Returns duplicates among files of equal size
 
-    Reads the files in step, chunk by chunk, keeping a running sha256 for
+    Reads the files in step, chunk by chunk, keeping a running hash for
     each file, and splits the group whenever the files' hashes so far
     differ. A file is dropped as soon as no other file matches it, so
     files that differ are read only up to the chunk where they differ,
@@ -152,9 +163,12 @@ def lockstep(files: List[str], size: int, stats: Counter) -> Dict[str, List[str]
         Size of the files in bytes
       stats:
         Counter for bytes read and read calls
+      hashfunc:
+        Hash constructor, such as hashlib.sha256 or blake3.blake3. Its
+        objects need update(), copy(), digest() and hexdigest().
 
     Returns:
-      A dict containing duplicate sha256 digests. Format
+      A dict containing duplicate hex digests of the whole files. Format
       {hashdigest1: [filepath1, filepath2],
        ...
       }
@@ -172,7 +186,7 @@ def lockstep(files: List[str], size: int, stats: Counter) -> Dict[str, List[str]
     groups = [group for group in buckets.values() if len(group) > 1]
 
     # Sequential chunks up to the tail block
-    hashes = {filename: sha256() for group in groups for filename in group}
+    hashes = {filename: hashfunc() for group in groups for filename in group}
     offset, chunk = 0, BLOCKSIZE
     while offset < tailstart and groups:
         length = min(chunk, tailstart - offset)
@@ -201,7 +215,8 @@ def lockstep(files: List[str], size: int, stats: Counter) -> Dict[str, List[str]
     return duplicates
 
 def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None,
-              stats: Optional[Counter] = None, minsize: int = 0) -> Dict[str, List[str]]:
+              stats: Optional[Counter] = None, minsize: int = 0,
+              hashfunc: Optional[Callable] = None) -> Dict[str, List[str]]:
     """Returns duplicate files
 
     Walks through a file path and finds duplicates by comparing hash digests of the files.
@@ -222,8 +237,12 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
         files and bytes, read calls, bytes read, and duplicate files and bytes
       minsize:
         Ignore files smaller than this many bytes
+      hashfunc:
+        Hash constructor; defaults to HASHES[DEFAULT_HASH], i.e. blake3 when
+        installed, else sha256
     Returns:
-      A dict of duplicates. The keys are sha256 digests of the files. Format:
+      A dict of duplicates. The keys are hex digests of the files, matching
+      sha256sum or b3sum output. Format:
       {hashdigest1: [filepath1, filepath2],
        ...
       }
@@ -231,6 +250,8 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
 
     if stats is None:
         stats = Counter()
+    if hashfunc is None:
+        hashfunc = HASHES[DEFAULT_HASH]
 
     sizes: Dict[int, List[str]] = {}
     inodes = set()
@@ -249,7 +270,7 @@ def dupfinder(path: Union[str, os.PathLike], exclude: Optional[List[str]] = None
     for size, files in groups.items():
         stats['candidates'] += len(files)
         stats['candidate_bytes'] += size * len(files)
-        for digest, group in lockstep(files, size, stats).items():
+        for digest, group in lockstep(files, size, stats, hashfunc).items():
             stats['duplicates'] += len(group)
             stats['duplicate_bytes'] += size * len(group)
             dups[digest] = group
@@ -301,6 +322,10 @@ if __name__ == '__main__':
     parser.add_argument('--minsize', dest='minsize', type=size, action='store',
                         help="Ignore files smaller than this, e.g. 4096, 100K or 1.5M", default=0
                        )
+    parser.add_argument('--hash', dest='hash', choices=['blake3', 'sha256'], action='store',
+                        help="Hash function. Default blake3 if installed, else sha256",
+                        default=DEFAULT_HASH
+                       )
     parser.add_argument('--stats', dest='stats', action='store_true',
                         help="Print read statistics to stderr"
                        )
@@ -311,12 +336,15 @@ if __name__ == '__main__':
                         help="Debug level logging"
                        )
     args = parser.parse_args()
+    if args.hash not in HASHES:
+        parser.error(f"{args.hash} is not installed; pip install {args.hash}")
 
     level = logging.DEBUG if args.debug else logging.INFO if args.verbose else logging.WARNING
     logging.basicConfig(format='dupfinder: %(message)s', level=level)
 
     stats: Counter = Counter()
-    dups = dupfinder(args.path, args.exclude, stats, minsize=args.minsize)
+    dups = dupfinder(args.path, args.exclude, stats, minsize=args.minsize,
+                     hashfunc=HASHES[args.hash])
 
     if args.format == 'json':
         print(json.dumps(dups, indent=4))
